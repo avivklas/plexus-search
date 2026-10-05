@@ -1,0 +1,190 @@
+{
+  "version": 2,
+  "description": "Elasticsearch Rally benchmark track comparing Plexus-Search vs Elasticsearch",
+  "indices": [
+    {
+      "name": "bench-articles",
+      "body": "index.json"
+    }
+  ],
+  "corpora": [
+    {
+      "name": "articles-corpus",
+      "documents": [
+        {
+          "source-file": "documents.json.bz2",
+          "document-count": 5000,
+          "compressed-bytes": 72348,
+          "uncompressed-bytes": 2684925,
+          "target-index": "bench-articles"
+        }
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "delete-index",
+      "operation-type": "delete-index"
+    },
+    {
+      "name": "create-index",
+      "operation-type": "create-index"
+    },
+    {
+      "name": "check-cluster-health",
+      "operation-type": "cluster-health",
+      "request-params": {
+        "wait_for_status": "green"
+      }
+    },
+    {
+      "name": "bulk-index",
+      "operation-type": "bulk",
+      "bulk-size": 250
+    },
+    {
+      "name": "refresh",
+      "operation-type": "refresh"
+    },
+    {
+      "name": "match-all-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "match_all": {}
+        }
+      }
+    },
+    {
+      "name": "match-title-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "match": {
+            "title": "Consensus"
+          }
+        }
+      }
+    },
+    {
+      "name": "match-phrase-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "match_phrase": {
+            "body": "Zero CDC lag"
+          }
+        }
+      }
+    },
+    {
+      "name": "term-category-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "term": {
+            "category": "distributed-systems"
+          }
+        }
+      }
+    },
+    {
+      "name": "numeric-range-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "range": {
+            "views": {
+              "gte": 10000,
+              "lte": 50000
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "bool-compound-query",
+      "operation-type": "search",
+      "body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "match": {
+                  "title": "Consensus"
+                }
+              }
+            ],
+            "filter": [
+              {
+                "term": {
+                  "category": "distributed-systems"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "challenges": [
+    {
+      "name": "full-comparison-challenge",
+      "description": "Comprehensive benchmark suite testing bulk indexing throughput and multiple search patterns",
+      "default": true,
+      "schedule": [
+        {
+          "operation": "delete-index"
+        },
+        {
+          "operation": "create-index"
+        },
+        {
+          "operation": "check-cluster-health"
+        },
+        {
+          "operation": "bulk-index"
+        },
+        {
+          "operation": "refresh"
+        },
+        {
+          "operation": "match-all-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        },
+        {
+          "operation": "match-title-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        },
+        {
+          "operation": "match-phrase-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        },
+        {
+          "operation": "term-category-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        },
+        {
+          "operation": "numeric-range-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        },
+        {
+          "operation": "bool-compound-query",
+          "clients": 2,
+          "warmup-iterations": 50,
+          "iterations": 250
+        }
+      ]
+    }
+  ]
+}

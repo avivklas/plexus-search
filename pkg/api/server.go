@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/avivklas/plexus-search/pkg/searcher"
@@ -14,24 +15,28 @@ import (
 
 // Server provides the REST HTTP API for Plexus-Search.
 type Server struct {
-	httpServer *http.Server
-	searcher   *searcher.Searcher
-	listener   net.Listener
-	addr       string
+	httpServer     *http.Server
+	searcher       *searcher.Searcher
+	listener       net.Listener
+	addr           string
+	indicesMu      sync.RWMutex
+	createdIndices map[string]bool
 }
 
 // NewServer initializes a new REST API Server.
 func NewServer(addr string, s *searcher.Searcher) (*Server, error) {
 	mux := http.NewServeMux()
 	srv := &Server{
-		searcher: s,
-		addr:     addr,
+		searcher:       s,
+		addr:           addr,
+		createdIndices: make(map[string]bool),
 	}
 
 	srv.registerRoutes(mux)
 
-	// Wrap mux with middleware (recovery, CORS, logging)
-	handler := srv.corsMiddleware(srv.recoveryMiddleware(mux))
+	// Wrap mux with Elasticsearch compatibility layer, CORS, and recovery middleware
+	esHandler := srv.wrapESCompat(mux)
+	handler := srv.corsMiddleware(srv.recoveryMiddleware(esHandler))
 
 	srv.httpServer = &http.Server{
 		Addr:         addr,
@@ -112,6 +117,7 @@ func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Elastic-Product", "Elasticsearch")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }

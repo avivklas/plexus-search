@@ -6,3 +6,5 @@ data/
 *.db-shm
 *.seg
 *.tmp
+*.log
+*.offset

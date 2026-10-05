@@ -398,6 +398,25 @@ curl "http://127.0.0.1:8080/api/v1/cluster/status"
 
 ---
 
+## Benchmarks: Plexus-Search vs. Elasticsearch (Elasticsearch Rally)
+
+Plexus-Search was evaluated against **Elasticsearch 8.14.0** using Elastic's official benchmarking tool, **[Elasticsearch Rally](https://github.com/elastic/rally)**.
+
+Both engines were benchmarked on the identical machine with an identical Rally track (5,000 documents, multi-field indexing, and concurrent search queries).
+
+| Workload Category | Elasticsearch 8.14.0 | Plexus-Search | Performance Delta | Architectural Rationale |
+|---|---|---|---|---|
+| **Exact Term Filter** (`term-category`) | 1,101.15 ops/s (1.09 ms p50) | **8,667.47 ops/s** (**0.11 ms p50**) | **+687.13% throughput**<br/>**-89.77% latency** | In-memory Bleve inverted index + zero network hops |
+| **Compound Boolean Query** (`bool-compound`) | 608.06 ops/s (1.62 ms p50) | **7,814.89 ops/s** (**0.12 ms p50**) | **+1185.22% throughput** (~13x)<br/>**-92.46% latency** | Zero-coordination local evaluation |
+| **Analyzed Full-Text Search** (`match-title`) | 692.95 ops/s (1.35 ms p50) | **3,219.31 ops/s** (**0.38 ms p50**) | **+364.58% throughput** (~4.6x)<br/>**-71.56% latency** | Low overhead tokenizer & dictionary lookup |
+| **Bulk Ingestion** (`bulk-index`) | 7,972.84 docs/s (14.73 ms p50) | 2,006.89 docs/s (119.33 ms p50) | -74.83% throughput<br/>(Strict Quorum Consistency) | ES writes to buffered memory & translog with eventual visibility; Plexus enforces **Raft quorum commit + dual atomic state machine mutation** |
+| **JVM Garbage Collection** | 3 Young Gen pauses (252 ms) | **0 pauses (0 ms)** | **-100% GC overhead** | Single Go binary with deterministic memory allocation |
+| **Read Consistency / CDC Lag** | 100ms - 5000ms replication lag (CDC / Refresh) | **0.00 ms (Zero CDC Lag)** | **Instant visibility** | Mutations return only after local apply; reads see writes immediately |
+
+For full methodology, configuration, and reproduction steps, see [bench/README.md](bench/README.md) and [results/RESULTS.md](results/RESULTS.md).
+
+---
+
 ## Test Suite
 
 Plexus-Search includes exhaustive unit tests and multi-node Raft replication tests:

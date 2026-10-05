@@ -1,0 +1,34 @@
+{
+  "settings": {
+    "index.number_of_shards": 1,
+    "index.number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "id": {
+        "type": "keyword"
+      },
+      "title": {
+        "type": "text"
+      },
+      "body": {
+        "type": "text"
+      },
+      "category": {
+        "type": "keyword"
+      },
+      "views": {
+        "type": "integer"
+      },
+      "rating": {
+        "type": "float"
+      },
+      "published_year": {
+        "type": "integer"
+      },
+      "tags": {
+        "type": "keyword"
+      }
+    }
+  }
+}
