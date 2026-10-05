@@ -37,6 +37,10 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 	return &s3.PutObjectOutput{}, nil
 }
 
+func (f *fakeS3) CreateBucket(_ context.Context, in *s3.CreateBucketInput, _ ...func(*s3.Options)) (*s3.CreateBucketOutput, error) {
+	return &s3.CreateBucketOutput{}, nil
+}
+
 func (f *fakeS3) DeleteObject(_ context.Context, in *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
 	f.mu.Lock()
 	delete(f.objs, aws.ToString(in.Key))

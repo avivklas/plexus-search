@@ -23,6 +23,7 @@ type S3API interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	CreateBucket(ctx context.Context, in *s3.CreateBucketInput, opts ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
 }
 
 // S3Config configures the S3 document backend. Credentials come from the
@@ -80,6 +81,12 @@ func NewS3Backend(cfg S3Config) (*S3Backend, error) {
 	if conc <= 0 {
 		conc = 16
 	}
+
+	// Auto-create bucket if missing (useful for MinIO and test setups)
+	_, _ = client.CreateBucket(context.Background(), &s3.CreateBucketInput{
+		Bucket: aws.String(cfg.Bucket),
+	})
+
 	return &S3Backend{client: client, bucket: cfg.Bucket, prefix: prefix, conc: conc}, nil
 }
 
