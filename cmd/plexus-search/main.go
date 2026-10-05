@@ -9,6 +9,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,15 @@ func main() {
 		syncLog      = flag.Bool("sync-log", false, "Synchronously fsync Raft log appends to disk")
 		followerWait = flag.Bool("follower-wait", true, "Wait for follower local FSM apply on writes before returning ACK")
 		pprofAddr    = flag.String("pprof-addr", "", "HTTP pprof profile address (e.g. 127.0.0.1:6060)")
+
+		docBackend     = flag.String("doc-store", "mem", "Document storage backend: mem, pebble or s3 (the search index always stays in memory)")
+		docPebbleDir   = flag.String("doc-pebble-dir", "", "Pebble directory for -doc-store=pebble (default <data-dir>/docs)")
+		docPebbleSync  = flag.Bool("doc-pebble-sync", false, "fsync every Pebble document write")
+		docS3Bucket    = flag.String("doc-s3-bucket", "", "S3 bucket for -doc-store=s3")
+		docS3Prefix    = flag.String("doc-s3-prefix", "", "S3 key prefix for documents")
+		docS3Region    = flag.String("doc-s3-region", "", "S3 region (defaults to AWS config)")
+		docS3Endpoint  = flag.String("doc-s3-endpoint", "", "Custom S3 endpoint (MinIO, localstack, ...)")
+		docS3PathStyle = flag.Bool("doc-s3-path-style", false, "Use path-style S3 addressing")
 	)
 	flag.Parse()
 
@@ -67,7 +77,25 @@ func main() {
 	}
 
 	// 1. Initialize DocumentStore and Bleve IndexStore
-	docStore := docstore.New()
+	docCfg := docstore.Config{
+		Type:   docstore.BackendType(*docBackend),
+		Pebble: docstore.PebbleConfig{Dir: *docPebbleDir, Sync: *docPebbleSync},
+		S3: docstore.S3Config{
+			Bucket:    *docS3Bucket,
+			Prefix:    *docS3Prefix,
+			Region:    *docS3Region,
+			Endpoint:  *docS3Endpoint,
+			PathStyle: *docS3PathStyle,
+		},
+	}
+	if docCfg.Type == docstore.BackendPebble && docCfg.Pebble.Dir == "" {
+		docCfg.Pebble.Dir = filepath.Join(*dataDir, "docs")
+	}
+	docStore, err := docstore.Open(docCfg)
+	if err != nil {
+		log.Fatalf("failed to open document store (%s): %v", *docBackend, err)
+	}
+	defer docStore.Close()
 	indexStore := indexstore.New()
 	defer indexStore.Close()
 

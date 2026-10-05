@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -18,18 +19,47 @@ var (
 )
 
 // Store implements plexus.Store to store and replicate raw JSON documents.
+// Document bodies live in a pluggable Backend (memory, Pebble or S3); only
+// per-index document counts are held in memory.
 type Store struct {
 	plexus.BaseStore
 	mu      sync.RWMutex
-	docs    map[string]map[string]*Document // index -> docID -> Document
+	backend Backend
+	counts  map[string]int // index -> number of docs
 	mutator plexus.Mutator
 }
 
-// New creates an initialized document store.
+// New creates a document store backed by process memory.
 func New() *Store {
+	s, _ := NewWithBackend(NewMemBackend())
+	return s
+}
+
+// Open creates a document store using the backend selected by cfg.
+func Open(cfg Config) (*Store, error) {
+	b, err := OpenBackend(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s, err := NewWithBackend(b)
+	if err != nil {
+		b.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewWithBackend creates a document store on top of an existing backend,
+// loading the per-index counters from it.
+func NewWithBackend(b Backend) (*Store, error) {
+	counts, err := b.Counts()
+	if err != nil {
+		return nil, fmt.Errorf("load docstore counts: %w", err)
+	}
 	s := &Store{
 		BaseStore: plexus.NewBaseStore(),
-		docs:      make(map[string]map[string]*Document),
+		backend:   b,
+		counts:    counts,
 	}
 
 	// Register Raft mutating and state machine handlers
@@ -38,7 +68,12 @@ func New() *Store {
 	s.Handle(CmdDeleteDoc, s.handleDelete)
 	s.Handle(CmdBatchDocs, s.handleBatch)
 
-	return s
+	return s, nil
+}
+
+// Close releases the underlying backend.
+func (s *Store) Close() error {
+	return s.backend.Close()
 }
 
 // ID implements plexus.Store.
@@ -97,17 +132,14 @@ func (s *Store) ApplyPut(ctx context.Context, req PutDocRequest) (*Document, err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idxDocs, ok := s.docs[req.Index]
-	if !ok {
-		idxDocs = make(map[string]*Document)
-		s.docs[req.Index] = idxDocs
+	existing, err := s.backend.Get(req.Index, req.ID)
+	if err != nil {
+		return nil, err
 	}
 
-	existing, exists := idxDocs[req.ID]
 	var rev int64 = 1
 	createdAt := now
-
-	if exists {
+	if existing != nil {
 		rev = existing.Revision + 1
 		createdAt = existing.CreatedAt
 	}
@@ -122,7 +154,12 @@ func (s *Store) ApplyPut(ctx context.Context, req PutDocRequest) (*Document, err
 		UpdatedAt: now,
 	}
 
-	idxDocs[req.ID] = doc
+	if err := s.backend.Write([]*Document{doc}, nil); err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		s.counts[req.Index]++
+	}
 	return doc.Clone(), nil
 }
 
@@ -138,17 +175,18 @@ func (s *Store) ApplyDelete(ctx context.Context, req DeleteDocRequest) (bool, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idxDocs, ok := s.docs[req.Index]
-	if !ok {
+	existing, err := s.backend.Get(req.Index, req.ID)
+	if err != nil {
+		return false, err
+	}
+	if existing == nil {
 		return false, nil
 	}
 
-	_, exists := idxDocs[req.ID]
-	if !exists {
-		return false, nil
+	if err := s.backend.Write(nil, []DocKey{{req.Index, req.ID}}); err != nil {
+		return false, err
 	}
-
-	delete(idxDocs, req.ID)
+	s.decr(req.Index, 1)
 	return true, nil
 }
 
@@ -161,28 +199,36 @@ func (s *Store) ApplyBatch(ctx context.Context, req BatchDocsRequest) (*BatchDoc
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idxDocs, ok := s.docs[req.Index]
-	if !ok {
-		idxDocs = make(map[string]*Document)
-		s.docs[req.Index] = idxDocs
-	}
-
 	now := time.Now().UTC()
-	var putCount, delCount int
+	var putCount, delCount, delta int
+
+	// pending holds the in-batch view of touched docs (nil value = deleted),
+	// so repeated ids within a batch see each other's effects.
+	pending := make(map[string]*Document)
+	lookup := func(id string) (*Document, error) {
+		if d, ok := pending[id]; ok {
+			return d, nil
+		}
+		return s.backend.Get(req.Index, id)
+	}
 
 	for _, p := range req.Puts {
 		if p.ID == "" {
 			continue
 		}
-		existing, exists := idxDocs[p.ID]
+		existing, err := lookup(p.ID)
+		if err != nil {
+			return nil, err
+		}
 		var rev int64 = 1
 		createdAt := now
-		if exists {
+		if existing != nil {
 			rev = existing.Revision + 1
 			createdAt = existing.CreatedAt
+		} else {
+			delta++
 		}
-
-		idxDocs[p.ID] = &Document{
+		pending[p.ID] = &Document{
 			ID:        p.ID,
 			Index:     req.Index,
 			Revision:  rev,
@@ -198,16 +244,47 @@ func (s *Store) ApplyBatch(ctx context.Context, req BatchDocsRequest) (*BatchDoc
 		if d.ID == "" {
 			continue
 		}
-		if _, exists := idxDocs[d.ID]; exists {
-			delete(idxDocs, d.ID)
+		existing, err := lookup(d.ID)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			pending[d.ID] = nil
+			delta--
 			delCount++
 		}
+	}
+
+	var puts []*Document
+	var dels []DocKey
+	for id, d := range pending {
+		if d != nil {
+			puts = append(puts, d)
+		} else {
+			dels = append(dels, DocKey{req.Index, id})
+		}
+	}
+	if err := s.backend.Write(puts, dels); err != nil {
+		return nil, err
+	}
+	if delta >= 0 {
+		s.counts[req.Index] += delta
+	} else {
+		s.decr(req.Index, -delta)
 	}
 
 	return &BatchDocsResponse{
 		PutCount:    putCount,
 		DeleteCount: delCount,
 	}, nil
+}
+
+// decr lowers an index counter, dropping it at zero. Caller holds s.mu.
+func (s *Store) decr(index string, n int) {
+	s.counts[index] -= n
+	if s.counts[index] <= 0 {
+		delete(s.counts, index)
+	}
 }
 
 // Put proposes a document put through the Plexus cluster consensus.
@@ -243,24 +320,23 @@ func (s *Store) Put(ctx context.Context, req PutDocRequest) (*Document, error) {
 	return nil, fmt.Errorf("unexpected put response type: %T", res)
 }
 
-// Get executes a zero-hop in-memory read from the local node.
+// Get reads a document from the local node's backend.
 // Under Plexus's sequential consistency guarantee, this is always safe and strongly consistent
-// with previously acknowledged writes on this node.
+// with previously acknowledged writes on this node. Backend read errors are logged
+// and reported as not found.
 func (s *Store) Get(index, id string) (*Document, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	idxDocs, ok := s.docs[index]
-	if !ok {
+	doc, err := s.backend.Get(index, id)
+	if err != nil {
+		log.Printf("docstore: get %s/%s: %v", index, id, err)
 		return nil, false
 	}
-
-	doc, ok := idxDocs[id]
-	if !ok {
+	if doc == nil {
 		return nil, false
 	}
-
-	return doc.Clone(), true
+	return doc, true
 }
 
 // Delete proposes a document deletion through the Plexus cluster.
@@ -329,12 +405,7 @@ func (s *Store) Batch(ctx context.Context, req BatchDocsRequest) (*BatchDocsResp
 func (s *Store) Count(index string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	idxDocs, ok := s.docs[index]
-	if !ok {
-		return 0
-	}
-	return len(idxDocs)
+	return s.counts[index]
 }
 
 // ListIndexes returns all known index names.
@@ -342,26 +413,28 @@ func (s *Store) ListIndexes() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	indexes := make([]string, 0, len(s.docs))
-	for idx := range s.docs {
+	indexes := make([]string, 0, len(s.counts))
+	for idx := range s.counts {
 		indexes = append(indexes, idx)
 	}
 	return indexes
 }
 
-// AllDocs returns clones of all documents in the specified index.
+// AllDocs returns all documents in the specified index.
 func (s *Store) AllDocs(index string) []*Document {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	idxDocs, ok := s.docs[index]
-	if !ok {
+	var result []*Document
+	err := s.backend.Scan(func(d *Document) error {
+		if d.Index == index {
+			result = append(result, d)
+		}
 		return nil
-	}
-
-	result := make([]*Document, 0, len(idxDocs))
-	for _, doc := range idxDocs {
-		result = append(result, doc.Clone())
+	})
+	if err != nil {
+		log.Printf("docstore: scan %s: %v", index, err)
+		return nil
 	}
 	return result
 }
@@ -371,13 +444,18 @@ func (s *Store) Snapshot() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	snapDocs := make(map[string]map[string]*Document, len(s.docs))
-	for idx, docsMap := range s.docs {
-		copiedMap := make(map[string]*Document, len(docsMap))
-		for id, doc := range docsMap {
-			copiedMap[id] = doc.Clone()
+	snapDocs := make(map[string]map[string]*Document, len(s.counts))
+	err := s.backend.Scan(func(d *Document) error {
+		m, ok := snapDocs[d.Index]
+		if !ok {
+			m = make(map[string]*Document)
+			snapDocs[d.Index] = m
 		}
-		snapDocs[idx] = copiedMap
+		m[d.ID] = d
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan docstore: %w", err)
 	}
 
 	data := SnapshotData{
@@ -387,6 +465,8 @@ func (s *Store) Snapshot() ([]byte, error) {
 
 	return json.Marshal(data)
 }
+
+const restoreChunk = 1000
 
 // Restore resets the store state from a snapshot byte slice.
 func (s *Store) Restore(data []byte) error {
@@ -398,13 +478,36 @@ func (s *Store) Restore(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.docs = make(map[string]map[string]*Document, len(snap.Documents))
-	for idx, docsMap := range snap.Documents {
-		s.docs[idx] = make(map[string]*Document, len(docsMap))
-		for id, doc := range docsMap {
-			s.docs[idx][id] = doc.Clone()
-		}
+	if err := s.backend.Reset(); err != nil {
+		return fmt.Errorf("reset docstore backend: %w", err)
 	}
 
+	counts := make(map[string]int, len(snap.Documents))
+	chunk := make([]*Document, 0, restoreChunk)
+	flush := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		err := s.backend.Write(chunk, nil)
+		chunk = chunk[:0]
+		return err
+	}
+	for idx, docsMap := range snap.Documents {
+		for id, doc := range docsMap {
+			doc.Index, doc.ID = idx, id
+			chunk = append(chunk, doc)
+			counts[idx]++
+			if len(chunk) == restoreChunk {
+				if err := flush(); err != nil {
+					return fmt.Errorf("restore docstore: %w", err)
+				}
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("restore docstore: %w", err)
+	}
+
+	s.counts = counts
 	return nil
 }
